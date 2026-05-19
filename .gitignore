@@ -1,4 +1,5 @@
 .DS_Store
+.venv/
 *.pyc
 *egg-info/
 build
@@ -7,6 +8,7 @@ docs*
 secret*
 *.conf
 *.txt
+!LICENSE.txt
 *.html
 *.gif
 *.png

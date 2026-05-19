@@ -12,7 +12,7 @@ from secret import key
 
 def main():
     parser = argparse.ArgumentParser(description="Send the daily Astronomy Picture of the Day.")
-    parser.add_argument("--config", help="configuration file for telegram-send", type=str)
+    parser.add_argument("--config", help="configuration file for telegram-send-wait", type=str)
     args = parser.parse_args()
     conf_command = ["--config", args.config] if args.config else []
 
@@ -39,11 +39,11 @@ def main():
         filename = "astro"
         with open(filename, "wb") as f:
             f.write(image)
-        call(["telegram-send", "--image", filename, "--caption", title + " - " + link] + conf_command)
+        call(["telegram-send-wait", "--image", filename, "--caption", title + " - " + link] + conf_command)
         os.remove(filename)
     elif data["media_type"] == "video":
         message = url
-        call(["telegram-send", message] + conf_command)
+        call(["telegram-send-wait", message] + conf_command)
 
 
 if __name__ == "__main__":
