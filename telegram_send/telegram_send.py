@@ -51,7 +51,8 @@ except ImportError:
 legacy_global_config = "/etc/telegram-send.conf"
 global_config = "/etc/telegram-send-wait.conf"
 ALLOWED_UPDATES = ["message"]
-POLL_READ_TIMEOUT = 10.0
+POLL_INTERVAL = 50  # Telegram long-polling maximum (seconds)
+READ_TIMEOUT_MARGIN = 15.0  # HTTP read_timeout must exceed poll timeout
 DEFAULT_NETWORK_TIMEOUT = 30.0
 DEFAULT_WAIT_TIMEOUT = 300.0
 
@@ -69,6 +70,10 @@ def migrate_global_config() -> None:
         return
     copy2(legacy_global_config, global_config)
     print(f"Config migrada de {legacy_global_config} a {global_config}", file=sys.stderr)
+
+
+def _is_poll_timeout_error(exc: BaseException) -> bool:
+    return isinstance(exc, telegram.error.NetworkError) and "timed out" in str(exc).lower()
 
 
 def as_message_id(message) -> int:
@@ -92,12 +97,17 @@ def chat_matches(message: telegram.Message, configured_chat_id: int | str) -> bo
 async def discard_pending_updates(bot: telegram.Bot) -> int | None:
     offset = None
     while True:
-        updates = await bot.get_updates(
-            offset=offset,
-            timeout=0,
-            read_timeout=0,
-            allowed_updates=ALLOWED_UPDATES,
-        )
+        try:
+            updates = await bot.get_updates(
+                offset=offset,
+                timeout=0,
+                read_timeout=DEFAULT_NETWORK_TIMEOUT,
+                allowed_updates=ALLOWED_UPDATES,
+            )
+        except telegram.error.NetworkError as e:
+            if _is_poll_timeout_error(e):
+                break
+            raise
         if not updates:
             break
         offset = updates[-1].update_id + 1
@@ -114,7 +124,7 @@ async def wait_for_reply(
     chat_id: int | str | None = None,
     offset: int | None = None,
     sent_after: float | None = None,
-    poll_read_timeout: float = POLL_READ_TIMEOUT,
+    poll_interval: float = POLL_INTERVAL,
 ) -> str:
     if bot is None:
         settings = get_config_settings(conf)
@@ -131,12 +141,22 @@ async def wait_for_reply(
     deadline = time.monotonic() + wait_timeout
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
-        poll_timeout = min(remaining, poll_read_timeout)
-        kwargs = {"timeout": poll_timeout, "read_timeout": poll_timeout + 1,
-                  "allowed_updates": ALLOWED_UPDATES}
+        if remaining < 0.5:
+            break
+        poll_timeout = min(remaining, poll_interval)
+        kwargs = {
+            "timeout": int(poll_timeout),
+            "read_timeout": poll_timeout + READ_TIMEOUT_MARGIN,
+            "allowed_updates": ALLOWED_UPDATES,
+        }
         if offset is not None:
             kwargs["offset"] = offset
-        updates = await bot.get_updates(**kwargs)
+        try:
+            updates = await bot.get_updates(**kwargs)
+        except telegram.error.NetworkError as e:
+            if _is_poll_timeout_error(e):
+                continue
+            raise
         for update in updates:
             offset = update.update_id + 1
             message = update.message
@@ -336,9 +356,15 @@ async def run():
         sys.exit(1)
     except telegram.error.NetworkError as e:
         if "timed out" in str(e).lower():
-            print(markup("Error: Connection timed out", "red"))
-            print("Please run with a longer timeout.\n"
-                  f"Try with the option: {markup(f'--timeout {args.timeout + 10}', 'bold')}")
+            if args.wait_reply:
+                print(markup("Error: Network timeout while waiting for a reply.", "red"),
+                      file=sys.stderr)
+                print("Check your connection or proxy. --timeout is how long to wait for a "
+                      "message, not the HTTP read timeout.", file=sys.stderr)
+            else:
+                print(markup("Error: Connection timed out", "red"))
+                print("Please run with a longer timeout.\n"
+                      f"Try with the option: {markup(f'--timeout {args.timeout + 10}', 'bold')}")
             sys.exit(1)
         else:
             raise e
