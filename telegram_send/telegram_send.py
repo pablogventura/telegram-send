@@ -72,7 +72,11 @@ def migrate_global_config() -> None:
 
 
 def as_message_id(message) -> int:
-    return message.message_id if hasattr(message, "message_id") else message["message_id"]
+    if isinstance(message, int):
+        return message
+    if hasattr(message, "message_id"):
+        return message.message_id
+    return message["message_id"]
 
 
 def chat_matches(message: telegram.Message, configured_chat_id: int | str) -> bool:
