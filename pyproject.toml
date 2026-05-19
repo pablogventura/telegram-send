@@ -4,7 +4,7 @@ dynamic = ["version"]
 description = "Send messages over Telegram and wait for a text reply from the command-line (fork of telegram-send)."
 readme = "README.md"
 authors = [
-    {name = "Pablo Ventura"},
+    {name = "Pablo Ventura", email = "pablogventura@gmail.com"},
     {name = "Rahiel Kasim", email = "rahielkasim@gmail.com"},
 ]
 license = "GPL-3.0-or-later"
