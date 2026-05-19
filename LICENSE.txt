@@ -1,3 +1,6 @@
+telegram-send-wait is a fork of telegram-send.
+Additional copyright (C) 2026 Pablo Ventura
+
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
 

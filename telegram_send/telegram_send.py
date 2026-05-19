@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# telegram-send - Send messages and files over Telegram from the command-line
+# telegram-send-wait - Send messages over Telegram and wait for replies (fork of telegram-send)
 # Copyright (C) 2016-2026  Rahiel Kasim
 #
 # This program is free software: you can redistribute it and/or modify
@@ -19,11 +19,12 @@ import asyncio
 import configparser
 import re
 import sys
+import time
 from copy import deepcopy
 from os import makedirs, remove
 from os.path import dirname, exists, expanduser, join
 from random import randint
-from shutil import which
+from shutil import copy2, which
 from typing import NamedTuple
 from subprocess import check_output
 from warnings import warn
@@ -47,7 +48,110 @@ except ImportError:
     pass
 
 
-global_config = "/etc/telegram-send.conf"
+legacy_global_config = "/etc/telegram-send.conf"
+global_config = "/etc/telegram-send-wait.conf"
+ALLOWED_UPDATES = ["message"]
+POLL_READ_TIMEOUT = 10.0
+DEFAULT_NETWORK_TIMEOUT = 30.0
+DEFAULT_WAIT_TIMEOUT = 300.0
+
+
+class WaitReplyTimeout(Exception):
+    pass
+
+
+class ConfigError(Exception):
+    pass
+
+
+def migrate_global_config() -> None:
+    if exists(global_config) or not exists(legacy_global_config):
+        return
+    copy2(legacy_global_config, global_config)
+    print(f"Config migrada de {legacy_global_config} a {global_config}", file=sys.stderr)
+
+
+def as_message_id(message) -> int:
+    return message.message_id if hasattr(message, "message_id") else message["message_id"]
+
+
+def chat_matches(message: telegram.Message, configured_chat_id: int | str) -> bool:
+    if message.chat_id == configured_chat_id:
+        return True
+    if isinstance(configured_chat_id, str) and configured_chat_id.startswith("@"):
+        username = configured_chat_id[1:].lower()
+        if message.chat and message.chat.username:
+            return message.chat.username.lower() == username
+    return False
+
+
+async def discard_pending_updates(bot: telegram.Bot) -> int | None:
+    offset = None
+    while True:
+        updates = await bot.get_updates(
+            offset=offset,
+            timeout=0,
+            read_timeout=0,
+            allowed_updates=ALLOWED_UPDATES,
+        )
+        if not updates:
+            break
+        offset = updates[-1].update_id + 1
+    return offset
+
+
+async def wait_for_reply(
+    *,
+    conf=None,
+    sent_message_ids: list[int],
+    wait_timeout: float = DEFAULT_WAIT_TIMEOUT,
+    require_reply: bool = False,
+    bot: telegram.Bot | None = None,
+    chat_id: int | str | None = None,
+    offset: int | None = None,
+    sent_after: float | None = None,
+    poll_read_timeout: float = POLL_READ_TIMEOUT,
+) -> str:
+    if bot is None:
+        settings = get_config_settings(conf)
+        bot = telegram.Bot(settings.token)
+        chat_id = settings.chat_id
+    if chat_id is None:
+        raise ValueError("chat_id is required when bot is provided without conf")
+
+    if offset is None:
+        offset = await discard_pending_updates(bot)
+    if sent_after is None:
+        sent_after = time.time()
+
+    deadline = time.monotonic() + wait_timeout
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        poll_timeout = min(remaining, poll_read_timeout)
+        kwargs = {"timeout": poll_timeout, "read_timeout": poll_timeout + 1,
+                  "allowed_updates": ALLOWED_UPDATES}
+        if offset is not None:
+            kwargs["offset"] = offset
+        updates = await bot.get_updates(**kwargs)
+        for update in updates:
+            offset = update.update_id + 1
+            message = update.message
+            if message is None:
+                continue
+            if not chat_matches(message, chat_id):
+                continue
+            if message.from_user and message.from_user.is_bot:
+                continue
+            if not message.text:
+                continue
+            if message.date.timestamp() < sent_after - 1:
+                continue
+            if require_reply:
+                replied = message.reply_to_message
+                if replied is None or replied.message_id not in sent_message_ids:
+                    continue
+            return message.text
+    raise WaitReplyTimeout()
 
 
 def main():
@@ -55,8 +159,8 @@ def main():
 
 
 async def run():
-    parser = argparse.ArgumentParser(description="Send messages and files over Telegram.",
-                                     epilog="Homepage: https://github.com/rahiel/telegram-send")
+    parser = argparse.ArgumentParser(description="Send messages and files over Telegram; optionally wait for a reply.",
+                                     epilog="Homepage: https://github.com/pablogventura/telegram-send")
     parser.add_argument("message", help="message(s) to send", nargs="*")
     parser.add_argument("--format", default="text", dest="parse_mode", choices=["text", "markdown", "html"],
                         help="How to format the message(s). Choose from 'text', 'markdown', or 'html'")
@@ -86,24 +190,46 @@ async def run():
                         help="delete sent messages by id (only last 48h), see --showids",
                         nargs="+", type=int)
     parser.add_argument("--config", help="specify configuration file", type=str, dest="conf", action="append")
-    parser.add_argument("-g", "--global-config", help="Use the global configuration at /etc/telegram-send.conf",
+    parser.add_argument("-g", "--global-config",
+                        help=f"Use the global configuration at {global_config}",
                         action="store_true")
     parser.add_argument("--file-manager", help="Integrate %(prog)s in the file manager", action="store_true")
     parser.add_argument("--clean", help="Clean %(prog)s configuration files.", action="store_true")
-    parser.add_argument("--timeout", help="Set the read timeout for network operations. (in seconds)",
-                        type=float, default=30., action="store")
+    parser.add_argument("--timeout",
+                        help="Network read timeout in seconds (default 30), or total wait for a reply with --wait-reply (default 300)",
+                        type=float, default=None, action="store")
+    parser.add_argument("--wait-reply", help="After sending, wait for an incoming text reply on stdout",
+                        action="store_true")
+    parser.add_argument("--reply-to-sent",
+                        help="With --wait-reply, only accept replies to the message(s) just sent",
+                        action="store_true")
+    parser.add_argument("--quiet", help="With --wait-reply, suppress stderr while waiting (timeout still reported)",
+                        action="store_true")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
+
+    if args.timeout is None:
+        args.timeout = DEFAULT_WAIT_TIMEOUT if args.wait_reply else DEFAULT_NETWORK_TIMEOUT
+    if args.reply_to_sent and not args.wait_reply:
+        print(markup("--reply-to-sent requires --wait-reply", "red"), file=sys.stderr)
+        sys.exit(1)
+    if args.quiet and not args.wait_reply:
+        print(markup("--quiet requires --wait-reply", "red"), file=sys.stderr)
+        sys.exit(1)
 
     conf : list[str | None]
 
     if args.global_config:
+        migrate_global_config()
         conf = [global_config]
     elif args.conf is None:
         conf = [None]
     else:
         conf = args.conf
 
+    if args.configure or args.configure_channel or args.configure_group:
+        if args.global_config:
+            migrate_global_config()
     if args.configure:
         return await configure(conf[0], fm_integration=True)
     elif args.configure_channel:
@@ -129,7 +255,51 @@ async def run():
             sys.exit(0)
         args.message = [message] + args.message
 
+    if args.wait_reply:
+        if not args.message:
+            print(markup("--wait-reply requires a message or --stdin", "red"), file=sys.stderr)
+            sys.exit(1)
+        if len(conf) > 1:
+            print(markup("--wait-reply supports only one --config", "red"), file=sys.stderr)
+            sys.exit(1)
+        incompatible = (
+            args.delete, args.showids, args.file, args.image, args.sticker,
+            args.animation, args.video, args.audio, args.location,
+        )
+        if any(incompatible):
+            print(markup("--wait-reply is only supported with text messages", "red"), file=sys.stderr)
+            sys.exit(1)
+
+    network_timeout = DEFAULT_NETWORK_TIMEOUT if args.wait_reply else args.timeout
+
     try:
+        if args.wait_reply:
+            settings = get_config_settings(conf[0])
+            bot = telegram.Bot(settings.token)
+            offset = await discard_pending_updates(bot)
+            sent_after = time.time()
+            message_ids = await send(
+                messages=args.message,
+                conf=conf[0],
+                parse_mode=args.parse_mode,
+                pre=args.pre,
+                silent=args.silent,
+                disable_web_page_preview=args.disable_web_page_preview,
+                timeout=network_timeout,
+            )
+            sent_ids = [as_message_id(m) for m in message_ids]
+            reply = await wait_for_reply(
+                bot=bot,
+                chat_id=settings.chat_id,
+                sent_message_ids=sent_ids,
+                wait_timeout=args.timeout,
+                require_reply=args.reply_to_sent,
+                offset=offset,
+                sent_after=sent_after,
+            )
+            print(reply)
+            sys.exit(0)
+
         await delete(args.delete, conf=conf[0])
         message_ids = []
         for c in conf:
@@ -151,8 +321,11 @@ async def run():
                 timeout=args.timeout
             )
         if args.showids and message_ids:
-            smessage_ids = [str(m) for m in message_ids]
+            smessage_ids = [str(as_message_id(m)) for m in message_ids]
             print(f"message_ids {' '.join(smessage_ids)}")
+    except WaitReplyTimeout:
+        print(markup("Timed out waiting for a reply.", "red"), file=sys.stderr)
+        sys.exit(2)
     except ConfigError as e:
         print(markup(str(e), "red"))
         print(f"Please read the docs and configure correctly.")
@@ -249,11 +422,11 @@ async def send(*,
                     "red"))
                 ms = split_message(m, MessageLimit.MAX_TEXT_LENGTH)
                 for m in ms:
-                    message_ids += [(await send_message(m, parse_mode))["message_id"]]
+                    message_ids += [as_message_id(await send_message(m, parse_mode))]
             elif len(m) == 0:
                 continue
             else:
-                message_ids += [(await send_message(m, parse_mode))["message_id"]]
+                message_ids += [as_message_id(await send_message(m, parse_mode))]
 
     def make_captions(items, captions):
         # make captions equal length when not all images/files have captions
@@ -344,7 +517,9 @@ async def delete(message_ids, conf=None, timeout=30):
     if message_ids:
         for m in message_ids:
             try:
-                await bot.delete_message(chat_id=chat_id, message_id=m, read_timeout=timeout)
+                await bot.delete_message(
+                    chat_id=chat_id, message_id=as_message_id(m), read_timeout=timeout,
+                )
             except telegram.error.TelegramError as e:
                 warn(markup(f"Deleting message with id={m} failed: {e}", "red"))
 
@@ -422,7 +597,7 @@ async def configure(conf=None, channel=False, group=False, fm_integration=False)
             except (telegram.error.Forbidden, telegram.error.BadRequest):
                 # Telegram returns a BadRequest when a non-admin bot tries to send to a private channel
                 input(f"Please add {markup(bot_name, 'cyan')} as administrator to your channel and press Enter")
-        print(markup("\nCongratulations! telegram-send can now post to your channel!", "green"))
+        print(markup("\nCongratulations! telegram-send-wait can now post to your channel!", "green"))
     else:
         password = "".join([str(randint(0, 9)) for _ in range(5)])
         bot_url = contact_url + bot_name
@@ -438,7 +613,9 @@ async def configure(conf=None, channel=False, group=False, fm_integration=False)
         update, update_id = None, None
 
         async def get_user():
-            updates = await bot.get_updates(offset=update_id, read_timeout=10)
+            updates = await bot.get_updates(
+                offset=update_id, read_timeout=10, allowed_updates=ALLOWED_UPDATES,
+            )
             for update in updates:
                 if update.message:
                     if update.message.text == password:
@@ -468,7 +645,7 @@ async def configure(conf=None, channel=False, group=False, fm_integration=False)
         if update.message.chat.is_forum:
             root_topic_message = get_root_topic_message(update.message)
 
-        text = f"🎊 Congratulations {user}! 🎊\ntelegram-send is now ready for use!"
+        text = f"🎊 Congratulations {user}! 🎊\ntelegram-send-wait is now ready for use!"
         print(markup(text, "green"))
 
         await bot.send_message(
@@ -499,16 +676,16 @@ def integrate_file_manager(clean=False):
         "Version=1.0\n"
         "Type=Application\n"
         "Encoding=UTF-8\n"
-        "Exec=telegram-send --file %F\n"
+        "Exec=telegram-send-wait --file %F\n"
         "Icon=telegram\n"
         "Name={}\n"
         "Selection=any\n"
         "Extensions=nodirs;\n"
         "Quote=double\n"
     )
-    name = "telegram-send"
+    name = "telegram-send-wait"
     script = """#!/bin/sh
-echo "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" | sed 's/ /\\\\ /g' | xargs telegram-send -f
+echo "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" | sed 's/ /\\\\ /g' | xargs telegram-send-wait -f
 """
     file_managers = [
         ("thunar", "~/.local/share/Thunar/sendto/", "Desktop Entry", "Telegram", ".desktop"),
@@ -542,13 +719,9 @@ def clean():
         try:
             remove(global_config)
         except OSError:
-            print(markup("Can't delete /etc/telegram-send.conf", "red"))
-            print(f"Please run: {markup('sudo telegram-send --clean', 'bold')}")
+            print(markup(f"Can't delete {global_config}", "red"))
+            print(f"Please run: {markup('sudo telegram-send-wait --clean', 'bold')}")
             sys.exit(1)
-
-
-class ConfigError(Exception):
-    pass
 
 
 class Settings(NamedTuple):
